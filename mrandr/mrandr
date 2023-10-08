@@ -1,0 +1,258 @@
+#!/bin/sh
+
+# mrandr - manage monitor profiles
+#
+# Copyright (C) 2022 Mehdi
+# License: MIT
+
+PROGRAM_NAME="$(basename "$0")"
+
+EXIT_SUCCESS=0
+EXIT_FAILURE=1
+
+fail() {
+  echo "$PROGRAM_NAME: $*" >&2
+  exit $EXIT_FAILURE
+}
+
+report() {
+  printf "%s: %s\n" "$PROGRAM_NAME" "$1"
+}
+
+CONFIG_PATH="${XDG_CONFIG_HOME:-"$HOME/.config"}/mrandr"
+
+usage() {
+cat << EOF
+$PROGRAM_NAME - manage monitor profiles
+
+Usage:
+  $PROGRAM_NAME save PROFILE
+    Save current configuration under the name PROFILE
+  $PROGRAM_NAME load PROFILE
+    Load configuration under the name PROFILE
+  $PROGRAM_NAME auto
+    Load the first profile matching with the connected monitors
+  $PROGRAM_NAME show PROFILE
+    Show the given profile configuration
+  $PROGRAM_NAME remove PROFILE
+    Remove the given profile
+  $PROGRAM_NAME list
+    List all profiles
+  $PROGRAM_NAME --help
+    Display this help and exit
+EOF
+}
+
+valid_profile_name() {
+  test -n "$1" \
+    -a "$(expr "$1" : '\([a-zA-Z0-9_-]\+\)')" = "$1" \
+    && return 0 || return 1
+}
+
+profile_exists() {
+  test -n "$1" \
+    -a "$(expr "$1" : '\([a-zA-Z0-9_-]\+\)')" = "$1" \
+    -a -d "$CONFIG_PATH/$1" \
+    && return 0 || return 1
+}
+
+print_fingerprint() {
+  if [ -n "$MRANDR_FINGERPRINT_CMD" ]
+  then
+    fingerprint="$($MRANDR_FINGERPRINT_CMD "$1")"
+  else
+    command -v edid-decode > /dev/null 2>&1 \
+      && fingerprint="$(edid-decode -o hex "$1" - 2> /dev/null)" \
+      || fingerprint="$(xxd -p "$1" 2> /dev/null)"
+  fi
+  [ -n "$fingerprint" ] \
+    && ( echo "$fingerprint" | tr -d '[:space:]' | tr -d '\n' ) \
+    && printf "\n"
+}
+
+print_enabled_monitors_fingerprint() {
+  for mon in /sys/class/drm/card*-*/
+  do
+    test -f "$mon/edid" \
+      -a -f "$mon/enabled" \
+      -a "$(cat "$mon/enabled")" = "enabled" \
+      && print_fingerprint "$mon/edid"
+  done | sort
+}
+
+print_connected_monitors_fingerprint() {
+  for mon in /sys/class/drm/card*-*/
+  do
+    [ -f "$mon/edid" ] && print_fingerprint "$mon/edid"
+  done | sort
+}
+
+gen_config() {
+  parser="$(dirname "$(realpath "$0")")"/mrandr-xrandr-parser.sed
+  xrandr --current | sed -f "$parser" | awk '{ print $0 "," NR-1 }'
+}
+
+infer_first_matching_profile() {
+  # get current fingerprint
+  fingerprint="$(print_enabled_monitors_fingerprint)"
+  # compare it with existing profile fingerprints
+  for profile_path in "$CONFIG_PATH"/*/
+  do
+    [ -d "$profile_path" ] && [ "$fingerprint" = "$(cat "$profile_path/fingerprint")" ] \
+      && basename "$profile_path" \
+      && return
+  done
+  printf "none"
+}
+
+save() {
+  profile="$1"
+  valid_profile_name "$profile" || fail "invalid profile name \`$profile'"
+  profile_path="$CONFIG_PATH/$profile"
+  mkdir -p "$profile_path"
+  # fingerprint
+  print_enabled_monitors_fingerprint > "$profile_path/fingerprint"
+  # config
+  gen_config > "$profile_path/config"
+  # report
+  report "profile \`$profile' saved"
+}
+
+load_config() {
+  profile="$1"
+  monitorsoff="$({
+    cut -d ',' -f 1 "$CONFIG_PATH/$profile/config";
+    xrandr --current | grep 'connected' | cut -d ' ' -f 1;
+  } | sort | uniq -u)"
+  cmd="$({
+    printf 'xrandr ';
+    sed 's/\(.*\),\(.*\),\(.*\),\(.*\),\(.*\),\(.*\)/--output \1 --\2 --mode \3 --pos \4 --rotate \5 --crtc \6/g' \
+      "$CONFIG_PATH/$profile/config";
+    [ -n "$monitorsoff" ] \
+      && echo "$monitorsoff" | sed 's/\(.*\)/--output \1 --off/g';
+  } | paste -sd ' ' -)"
+  eval "$cmd"
+}
+
+load() {
+  profile="$1"
+  profile_exists "$profile" || fail "profile \`$profile' not found"
+  profile_path="$CONFIG_PATH/$profile"
+  [ -f "$profile_path/config" ] || fail "setup script not found"
+  [ -f "$profile_path/fingerprint" ] || fail "fingerprint file not found"
+  # check if connected monitors match with given profile
+  connected_monitors="$(print_connected_monitors_fingerprint)"
+  while read -r line
+  do
+    if ! echo "$connected_monitors" | grep -qs "^$line$"
+    then
+      fail "a monitor required by profile \`$profile' is not connected"
+    fi
+  done < "$profile_path/fingerprint"
+  # preswitch hook
+  if [ -f "$profile_path/preswitch" ]
+  then
+    export MRANDR_CURRENT_PROFILE="$(infer_first_matching_profile)"
+    export MRANDR_NEXT_PROFILE="$profile"
+    sh "$profile_path/preswitch"
+  elif [ -f "$CONFIG_PATH/preswitch" ]
+  then
+    export MRANDR_CURRENT_PROFILE="$(infer_first_matching_profile)"
+    export MRANDR_NEXT_PROFILE="$profile"
+    sh "$CONFIG_PATH/preswitch"
+  fi
+  # load profile
+  load_config "$profile"
+  # postswitch hook
+  if [ -f "$profile_path/postswitch" ]
+  then
+    export MRANDR_PREVIOUS_PROFILE="$(infer_first_matching_profile)"
+    export MRANDR_CURRENT_PROFILE="$profile"
+    sh "$profile_path/postswitch"
+  elif [ -f "$CONFIG_PATH/postswitch" ]
+  then
+    export MRANDR_PREVIOUS_PROFILE="$(infer_first_matching_profile)"
+    export MRANDR_CURRENT_PROFILE="$profile"
+    sh "$CONFIG_PATH/postswitch"
+  fi
+  report "profile \`$profile' loaded"
+}
+
+auto() {
+  # get connected monitors fingerprint
+  fingerprint="$(print_connected_monitors_fingerprint)"
+  # compare with profile fingerprints
+  profile=""
+  for profile_path in "$CONFIG_PATH"/*/
+  do
+    [ -d "$profile_path" ] && [ "$(cat "$profile_path/fingerprint")" = "$fingerprint" ] \
+      && profile="$(basename "$profile_path")" \
+      && break
+  done
+  [ -z "$profile" ] && fail "no profile is matching with connected monitors"
+  load "$profile"
+}
+
+show() {
+  profile="$1"
+  profile_exists "$profile" || fail "profile \`$profile' not found"
+  printf "Profile: %s\n" "$profile"
+  printf "\nFingerprint:\n"
+  sed -e 's/^\(.\{13\}\).*\(.\{13\}\)$/  \1...\2/' < "$CONFIG_PATH/$profile/fingerprint"
+  printf "\nConfiguration:\n"
+  {
+    echo 'Display,Primary,Resolution,Position,Rotation'
+    cat "$CONFIG_PATH/$profile/config"
+  } | sed -e 's/^/  /g' -e 's/noprimary/no/g' -e 's/primary/yes/g' | \
+    column -t -s ','
+}
+
+list() {
+  connected="$(print_connected_monitors_fingerprint)"
+  enabled="$(print_enabled_monitors_fingerprint)"
+  for profile_path in "$CONFIG_PATH"/*/
+  do
+    [ -f "$profile_path/fingerprint" ] && [ -f "$profile_path/config" ] || continue
+    profile="$(basename "$profile_path")"
+    # check if active
+    [ "$(cat "$profile_path/fingerprint")" = "$enabled" ] \
+      && profile="$profile (active)"
+    # check if available
+    available=1
+    while read -r line
+    do
+      echo "$connected" | grep -qs "^$line$" \
+        || { available=0; break; }
+    done < "$profile_path/fingerprint"
+    [ $available -eq 1 ] && profile="$profile (available)"
+    echo "$profile"
+  done | sed '0,/(active) (available)/ s//(active)/1'
+}
+
+remove() {
+  profile="$1"
+  profile_exists "$profile" || fail "profile \`$profile' not found"
+  rm -rf "$CONFIG_PATH/$profile"
+  report "profile \`$profile' removed"
+}
+
+#######
+####### main
+#######
+
+[ $# -eq 0 ] && usage && exit $EXIT_SUCCESS
+
+mkdir -p "$CONFIG_PATH"
+
+case "$1" in
+  save) save "$2" ;;
+  load) load "$2" ;;
+  auto) auto ;;
+  show) show "$2" ;;
+  rm|remove) remove "$2" ;;
+  list) list ;;
+  -h|--help|help) usage ;;
+  *) fail "unknown option" ;;
+esac
+
+exit $EXIT_SUCCESS

@@ -4,3 +4,15 @@
 [submodule "st"]
 	path = st
 	url = https://github.com/Shourai/st.git
+[submodule "surf"]
+	path = surf
+	url = https://github.com/lkiesow/surf.git
+[submodule "sup"]
+	path = sup
+	url = https://github.com/dyne/sup.git
+[submodule "spt"]
+	path = spt
+	url = https://github.com/pickfire/spt.git
+[submodule "dwm"]
+	path = dwm
+	url = https://git.suckless.org/dwm

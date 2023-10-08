@@ -1,0 +1,6 @@
+[submodule "sltar"]
+	path = sltar
+	url = https://github.com/Gottox/sltar.git
+[submodule "st"]
+	path = st
+	url = https://github.com/Shourai/st.git
